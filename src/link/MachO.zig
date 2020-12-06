@@ -1888,38 +1888,36 @@ fn writeCodeSignature(self: *MachO) !void {
 fn writeExportTrie(self: *MachO) !void {
     if (self.global_symbols.items.len == 0) return;
 
-    var trie: Trie = .{};
-    defer trie.deinit(self.base.allocator);
+    var trie = Trie.init(self.base.allocator);
+    defer trie.deinit();
 
     const text_segment = self.load_commands.items[self.text_segment_cmd_index.?].Segment;
     for (self.global_symbols.items) |symbol| {
         // TODO figure out if we should put all global symbols into the export trie
         const name = self.getString(symbol.n_strx);
         assert(symbol.n_value >= text_segment.inner.vmaddr);
-        try trie.put(self.base.allocator, .{
+        try trie.put(.{
             .name = name,
             .vmaddr_offset = symbol.n_value - text_segment.inner.vmaddr,
             .export_flags = 0, // TODO workout creation of export flags
         });
     }
 
-    var buffer: std.ArrayListUnmanaged(u8) = .{};
-    defer buffer.deinit(self.base.allocator);
-
-    try trie.writeULEB128Mem(self.base.allocator, &buffer);
+    var buffer = try trie.writeULEB128Mem();
+    defer self.base.allocator.free(buffer);
 
     const dyld_info = &self.load_commands.items[self.dyld_info_cmd_index.?].DyldInfoOnly;
-    const export_size = @intCast(u32, mem.alignForward(buffer.items.len, @sizeOf(u64)));
+    const export_size = @intCast(u32, mem.alignForward(buffer.len, @sizeOf(u64)));
     dyld_info.export_off = self.linkedit_segment_next_offset.?;
     dyld_info.export_size = export_size;
 
     log.debug("writing export trie from 0x{x} to 0x{x}\n", .{ dyld_info.export_off, dyld_info.export_off + export_size });
 
-    if (export_size > buffer.items.len) {
+    if (export_size > buffer.len) {
         // Pad out to align(8).
         try self.base.file.?.pwriteAll(&[_]u8{0}, dyld_info.export_off + export_size);
     }
-    try self.base.file.?.pwriteAll(buffer.items, dyld_info.export_off);
+    try self.base.file.?.pwriteAll(buffer, dyld_info.export_off);
 
     self.linkedit_segment_next_offset = dyld_info.export_off + dyld_info.export_size;
     // Advance size of __LINKEDIT segment
