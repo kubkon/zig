@@ -733,14 +733,111 @@ fn linkWithLLD(self: *MachO, comp: *Compilation) !void {
                 const after_last_cmd_offset = self.header.?.sizeofcmds + @sizeOf(macho.mach_header_64);
                 const needed_size = @sizeOf(macho.linkedit_data_command);
                 if (needed_size + after_last_cmd_offset > text_section.offset) {
-                    // TODO We are in the position to be able to increase the padding by moving all sections
-                    // by the required offset, but this requires a little bit more thinking and bookkeeping.
-                    // For now, return an error informing the user of the problem.
-                    std.log.err("Not enough padding between load commands and start of __text section:\n", .{});
-                    std.log.err("Offset after last load command: 0x{x}\n", .{after_last_cmd_offset});
-                    std.log.err("Beginning of __text section: 0x{x}\n", .{text_section.offset});
-                    std.log.err("Needed size: 0x{x}\n", .{needed_size});
-                    return error.NotEnoughPadding;
+                    if (self.header.?.flags & macho.MH_PIE == 0) {
+                        std.log.err("Unable to extend padding between load commands and start of __text section.", .{});
+                        std.log.err("Re-run the linker with -headerpad <size> option if available, or", .{});
+                        std.log.err("fall back to the system linker.", .{});
+                        return error.NotEnoughPadding;
+                    }
+                    // Since the current contents is so tightly knit, adding any padding will
+                    // cause the __TEXT segment to expand by at least one page size. Therefore,
+                    // we will shift all remaining segments by one page size. We will proceed bottom-top:
+                    // 1. We will shift everything from the start of __text section up by exactly one page size.
+                    // 2. With this out of the way, we will update the load commands so that they point in
+                    //    the right places.
+                    // 3. Then, we need to update offsets in export trie.
+                    // 4. Finally, we need to update offsets in the symbol table.
+                    const linkedit_segment = self.load_commands.items[self.linkedit_segment_cmd_index.?].Segment;
+                    const file_size = linkedit_segment.inner.fileoff + linkedit_segment.inner.filesize;
+                    {
+                        // Shift everything from __text section by exactly one page size.
+                        const old_offset = text_section.offset;
+                        const new_offset = old_offset + self.page_size;
+                        const existing_size = file_size - old_offset;
+                        // TODO I think I just discovered a bug with copyRangeAll on macOS.
+                        // Investigate further!
+                        // const amt = try self.base.file.?.copyRangeAll(old_offset, self.base.file.?, new_offset, existing_size);
+                        // if (amt < existing_size) return error.InputOutput;
+                        var in_buffer = try self.base.allocator.alloc(u8, existing_size);
+                        defer self.base.allocator.free(in_buffer);
+                        const nread = try self.base.file.?.preadAll(in_buffer, old_offset);
+                        if (nread < in_buffer.len) return error.InputOutput;
+                        try self.base.file.?.pwriteAll(in_buffer, new_offset);
+                        // Zero out everything in between.
+                        var buffer = try self.base.allocator.alloc(u8, new_offset - old_offset);
+                        defer self.base.allocator.free(buffer);
+                        mem.set(u8, buffer, 0);
+                        try self.base.file.?.pwriteAll(buffer, old_offset);
+                    }
+                    // Update all offsets in the load commands.
+                    for (self.load_commands.items) |*lc| {
+                        switch (lc.cmd()) {
+                            macho.LC_SEGMENT_64 => {
+                                const cmd = &lc.Segment;
+                                if (isSegmentOrSection(&cmd.inner.segname, "__PAGEZERO")) {
+                                    continue;
+                                } else if (isSegmentOrSection(&cmd.inner.segname, "__TEXT")) {
+                                    cmd.inner.vmsize += self.page_size;
+                                    cmd.inner.filesize += self.page_size;
+                                } else {
+                                    cmd.inner.vmaddr += self.page_size;
+                                    cmd.inner.fileoff += self.page_size;
+                                }
+                                for (cmd.sections.items) |*sect| {
+                                    if (sect.addr > 0) sect.addr += self.page_size;
+                                    if (sect.offset > 0) sect.offset += self.page_size;
+                                    if (sect.reloff > 0) sect.reloff += self.page_size;
+                                }
+                            },
+                            macho.LC_DYLD_INFO_ONLY => {
+                                const cmd = &lc.DyldInfoOnly;
+                                if (cmd.rebase_off > 0) cmd.rebase_off += self.page_size;
+                                if (cmd.bind_off > 0) cmd.bind_off += self.page_size;
+                                if (cmd.weak_bind_off > 0) cmd.weak_bind_off += self.page_size;
+                                if (cmd.lazy_bind_off > 0) cmd.lazy_bind_off += self.page_size;
+                                if (cmd.export_off > 0) cmd.export_off += self.page_size;
+                            },
+                            macho.LC_SYMTAB => {
+                                const cmd = &lc.Symtab;
+                                if (cmd.symoff > 0) cmd.symoff += self.page_size;
+                                if (cmd.stroff > 0) cmd.stroff += self.page_size;
+                            },
+                            macho.LC_DYSYMTAB => {
+                                const cmd = &lc.Dysymtab;
+                                if (cmd.tocoff > 0) cmd.tocoff += self.page_size;
+                                if (cmd.modtaboff > 0) cmd.modtaboff += self.page_size;
+                                if (cmd.extrefsymoff > 0) cmd.extrefsymoff += self.page_size;
+                                if (cmd.indirectsymoff > 0) cmd.indirectsymoff += self.page_size;
+                                if (cmd.extreloff > 0) cmd.extreloff += self.page_size;
+                                if (cmd.locreloff > 0) cmd.locreloff += self.page_size;
+                            },
+                            macho.LC_MAIN => {
+                                const cmd = &lc.Main;
+                                if (cmd.entryoff > 0) cmd.entryoff += self.page_size;
+                            },
+                            macho.LC_FUNCTION_STARTS, macho.LC_CODE_SIGNATURE, macho.LC_DATA_IN_CODE => {
+                                const cmd = &lc.LinkeditData;
+                                if (cmd.dataoff > 0) cmd.dataoff += self.page_size;
+                            },
+                            else => {
+                                if (lc.* == LoadCommand.Unknown) return error.UnknownLoadCommand;
+                            },
+                        }
+                    }
+                    {
+                        // Update address offsets in the symbol table.
+                        const symtab = self.load_commands.items[self.symtab_cmd_index.?].Symtab;
+                        var buffer = try self.base.allocator.alloc(u8, symtab.nsyms * @sizeOf(macho.nlist_64));
+                        defer self.base.allocator.free(buffer);
+                        const nread = try self.base.file.?.preadAll(buffer, symtab.symoff);
+                        if (nread < buffer.len) return error.InputOutput;
+                        var symbols = mem.bytesAsSlice(macho.nlist_64, buffer);
+                        for (symbols) |*symbol| {
+                            if (symbol.n_value < 0x100000000) continue;
+                            symbol.n_value += self.page_size;
+                        }
+                        try self.base.file.?.pwriteAll(buffer, symtab.symoff);
+                    }
                 }
                 const linkedit_segment = self.load_commands.items[self.linkedit_segment_cmd_index.?].Segment;
                 // TODO This is clunky.
@@ -1918,6 +2015,8 @@ fn parseFromFile(self: *MachO, file: fs.File) !void {
                             self.text_section_index = @intCast(u16, j);
                         }
                     }
+                } else if (isSegmentOrSection(&x.inner.segname, "__DATA")) {
+                    self.data_segment_cmd_index = i;
                 }
             },
             macho.LC_SYMTAB => {
