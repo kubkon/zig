@@ -825,6 +825,30 @@ fn linkWithLLD(self: *MachO, comp: *Compilation) !void {
                         }
                     }
                     {
+                        // Update address offsets in the export trie.
+                        const dyld_info = self.load_commands.items[self.dyld_info_cmd_index.?].DyldInfoOnly;
+                        var buffer = try self.base.allocator.alloc(u8, dyld_info.export_size);
+                        defer self.base.allocator.free(buffer);
+                        const nread = try self.base.file.?.preadAll(buffer, dyld_info.export_off);
+                        if (nread < buffer.len) return error.InputOutput;
+                        var stream = std.io.fixedBufferStream(buffer);
+                        var trie = Trie.init(self.base.allocator);
+                        defer trie.deinit();
+                        try trie.fromByteStream(&stream);
+                        var nodes = try trie.nodes();
+                        defer self.base.allocator.free(nodes);
+                        for (nodes) |node| {
+                            if (node.vmaddr_offset) |*off| {
+                                std.debug.print("old_offset=0x{x},", .{off.*});
+                                off.* += self.page_size;
+                                std.debug.print("new_offset=0x{x}\n", .{off.*});
+                            }
+                        }
+                        var out_buffer = try trie.writeULEB128Mem();
+                        defer self.base.allocator.free(out_buffer);
+                        std.debug.print("buffer.len={},out_buffer.len={}\n", .{ buffer.len, out_buffer.len });
+                    }
+                    {
                         // Update address offsets in the symbol table.
                         const symtab = self.load_commands.items[self.symtab_cmd_index.?].Symtab;
                         var buffer = try self.base.allocator.alloc(u8, symtab.nsyms * @sizeOf(macho.nlist_64));
@@ -2016,6 +2040,9 @@ fn parseFromFile(self: *MachO, file: fs.File) !void {
                 } else if (isSegmentOrSection(&x.inner.segname, "__DATA")) {
                     self.data_segment_cmd_index = i;
                 }
+            },
+            macho.LC_DYLD_INFO_ONLY => {
+                self.dyld_info_cmd_index = i;
             },
             macho.LC_SYMTAB => {
                 self.symtab_cmd_index = i;

@@ -44,7 +44,7 @@ pub const Symbol = struct {
     export_flags: u64,
 };
 
-const Edge = struct {
+pub const Edge = struct {
     from: *Node,
     to: *Node,
     label: []u8,
@@ -59,7 +59,7 @@ const Edge = struct {
     }
 };
 
-const Node = struct {
+pub const Node = struct {
     base: *Trie,
     /// Export flags associated with this exported symbol (if any).
     export_flags: ?u64 = null,
@@ -123,7 +123,6 @@ const Node = struct {
     fn fromByteStream(self: *Node, stream: anytype) Trie.FromByteStreamError!void {
         self.trie_offset = try stream.getPos();
         var reader = stream.reader();
-        std.debug.print("trie_offset=0x{x}\n", .{self.trie_offset});
         const node_size = try reader.readByte();
         if (node_size > 0) {
             self.export_flags = try reader.readByte();
@@ -143,7 +142,6 @@ const Node = struct {
                 }
                 break :blk label_buf.toOwnedSlice();
             };
-            std.debug.print("label={}\n", .{label});
             const seek_to = try leb.readULEB128(u64, reader);
             const cur_pos = try stream.getPos();
             try stream.seekTo(seek_to);
@@ -285,18 +283,15 @@ pub fn fromByteStream(self: *Trie, stream: anytype) FromByteStreamError!void {
 /// Write the trie to a buffer ULEB128 encoded.
 /// Caller owns the memory and needs to free it.
 pub fn writeULEB128Mem(self: *Trie) ![]u8 {
-    var ordered_nodes = std.ArrayList(*Node).init(self.allocator);
-    defer ordered_nodes.deinit();
-
-    try ordered_nodes.ensureCapacity(self.node_count);
-    walkInOrder(&self.root.?, &ordered_nodes);
+    var ordered_nodes = try self.nodes();
+    defer self.allocator.free(ordered_nodes);
 
     var offset: usize = 0;
     var more: bool = true;
     while (more) {
         offset = 0;
         more = false;
-        for (ordered_nodes.items) |node| {
+        for (ordered_nodes) |node| {
             const res = node.updateOffset(offset);
             offset += res.node_size;
             if (res.updated) more = true;
@@ -305,10 +300,17 @@ pub fn writeULEB128Mem(self: *Trie) ![]u8 {
 
     var buffer = std.ArrayList(u8).init(self.allocator);
     try buffer.ensureCapacity(offset);
-    for (ordered_nodes.items) |node| {
+    for (ordered_nodes) |node| {
         try node.writeULEB128Mem(&buffer);
     }
     return buffer.toOwnedSlice();
+}
+
+pub fn nodes(self: *Trie) ![]*Node {
+    var ordered_nodes = std.ArrayList(*Node).init(self.allocator);
+    try ordered_nodes.ensureCapacity(self.node_count);
+    walkInOrder(&self.root.?, &ordered_nodes);
+    return ordered_nodes.toOwnedSlice();
 }
 
 /// Walks the trie in DFS order gathering all nodes into a linear stream of nodes.
@@ -539,7 +541,6 @@ test "parse Trie from byte stream" {
 
     var out_buffer = try trie.writeULEB128Mem();
     defer gpa.free(out_buffer);
-    std.debug.print("0x{x}\n", .{out_buffer});
 
     testing.expect(mem.eql(u8, in_buffer[0..], out_buffer));
 }
