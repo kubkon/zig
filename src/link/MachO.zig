@@ -838,14 +838,11 @@ fn linkWithLLD(self: *MachO, comp: *Compilation) !void {
                         defer self.base.allocator.free(nodes);
                         for (nodes) |node| {
                             if (node.vmaddr_offset) |*off| {
-                                std.debug.print("old_offset=0x{x},", .{off.*});
                                 off.* += self.page_size;
-                                std.debug.print("new_offset=0x{x}\n", .{off.*});
                             }
                         }
                         var out_buffer = try trie.writeULEB128Mem();
                         defer self.base.allocator.free(out_buffer);
-                        std.debug.print("buffer.len={},out_buffer.len={}\n", .{ buffer.len, out_buffer.len });
                         if (dyld_info.export_size < out_buffer.len) {
                             // We need to move all hidden sections by some amount.
                             const new_export_size = @intCast(u32, mem.alignForwardGeneric(u64, out_buffer.len, @sizeOf(u64)));
@@ -897,12 +894,95 @@ fn linkWithLLD(self: *MachO, comp: *Compilation) !void {
                             dyld_info.export_size = new_export_size;
                             const linkedit = &self.load_commands.items[self.linkedit_segment_cmd_index.?].Segment;
                             linkedit.inner.filesize += shift;
+                            file_size += shift;
                             if (linkedit.inner.vmsize < linkedit.inner.filesize) {
                                 linkedit.inner.vmsize = mem.alignForwardGeneric(u64, linkedit.inner.filesize, self.page_size);
                             }
                         }
                         // Save update export trie.
                         try self.base.file.?.pwriteAll(out_buffer, dyld_info.export_off);
+                    }
+                    {
+                        // Update function starts section.
+                        const fstarts = &self.load_commands.items[self.function_starts_cmd_index.?].LinkeditData;
+                        var buffer = try self.base.allocator.alloc(u8, fstarts.datasize);
+                        defer self.base.allocator.free(buffer);
+                        const nread = try self.base.file.?.preadAll(buffer, fstarts.dataoff);
+                        if (nread < buffer.len) return error.InputOutput;
+
+                        var stream = std.io.fixedBufferStream(buffer);
+                        var reader = stream.reader();
+                        var out_buffer = std.ArrayList(u8).init(self.base.allocator);
+                        defer out_buffer.deinit();
+                        var tmp_buffer: [@sizeOf(u64)]u8 = undefined;
+
+                        while (true) {
+                            const off = std.leb.readULEB128(u64, reader) catch |err| switch (err) {
+                                error.EndOfStream => break,
+                                else => |e| return e,
+                            };
+                            var out_stream = std.io.fixedBufferStream(tmp_buffer[0..]);
+                            try std.leb.writeULEB128(out_stream.writer(), off + self.page_size);
+                            try out_buffer.appendSlice(tmp_buffer[0..out_stream.pos]);
+                        }
+
+                        if (fstarts.datasize < out_buffer.items.len) {
+                            // We need to move all hidden sections by some amount.
+                            const new_size = @intCast(u32, mem.alignForwardGeneric(u64, out_buffer.items.len, @sizeOf(u64)));
+                            const shift = new_size - fstarts.datasize;
+                            const old_offset = fstarts.dataoff + fstarts.datasize;
+                            const new_offset = old_offset + shift;
+                            const existing_size = file_size - old_offset;
+                            // TODO I think I just discovered a bug with copyRangeAll on macOS.
+                            // Investigate further!
+                            // const amt = try self.base.file.?.copyRangeAll(old_offset, self.base.file.?, new_offset, existing_size);
+                            // if (amt < existing_size) return error.InputOutput;
+                            var in_buffer = try self.base.allocator.alloc(u8, existing_size);
+                            defer self.base.allocator.free(in_buffer);
+                            const nnread = try self.base.file.?.preadAll(in_buffer, old_offset);
+                            if (nnread < in_buffer.len) return error.InputOutput;
+                            try self.base.file.?.pwriteAll(in_buffer, new_offset);
+                            // Zero out everything in between.
+                            var tmp = try self.base.allocator.alloc(u8, new_offset - old_offset);
+                            defer self.base.allocator.free(tmp);
+                            mem.set(u8, tmp, 0);
+                            try self.base.file.?.pwriteAll(tmp, old_offset);
+
+                            for (self.load_commands.items) |*lc| {
+                                switch (lc.cmd()) {
+                                    macho.LC_SYMTAB => {
+                                        const cmd = &lc.Symtab;
+                                        if (cmd.symoff > 0) cmd.symoff += shift;
+                                        if (cmd.stroff > 0) cmd.stroff += shift;
+                                    },
+                                    macho.LC_DYSYMTAB => {
+                                        const cmd = &lc.Dysymtab;
+                                        if (cmd.tocoff > 0) cmd.tocoff += shift;
+                                        if (cmd.modtaboff > 0) cmd.modtaboff += shift;
+                                        if (cmd.extrefsymoff > 0) cmd.extrefsymoff += shift;
+                                        if (cmd.indirectsymoff > 0) cmd.indirectsymoff += shift;
+                                        if (cmd.extreloff > 0) cmd.extreloff += shift;
+                                        if (cmd.locreloff > 0) cmd.locreloff += shift;
+                                    },
+                                    macho.LC_DATA_IN_CODE, macho.LC_CODE_SIGNATURE => {
+                                        const cmd = &lc.LinkeditData;
+                                        if (cmd.dataoff > 0) cmd.dataoff += shift;
+                                    },
+                                    else => {},
+                                }
+                            }
+
+                            fstarts.datasize = new_size;
+                            const linkedit = &self.load_commands.items[self.linkedit_segment_cmd_index.?].Segment;
+                            linkedit.inner.filesize += shift;
+                            file_size += shift;
+                            if (linkedit.inner.vmsize < linkedit.inner.filesize) {
+                                linkedit.inner.vmsize = mem.alignForwardGeneric(u64, linkedit.inner.filesize, self.page_size);
+                            }
+                        }
+
+                        // Save update function starts section.
+                        try self.base.file.?.pwriteAll(out_buffer.items, fstarts.dataoff);
                     }
                     {
                         // Update address offsets in the symbol table.
