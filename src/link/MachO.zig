@@ -819,9 +819,7 @@ fn linkWithLLD(self: *MachO, comp: *Compilation) !void {
                                 const cmd = &lc.LinkeditData;
                                 if (cmd.dataoff > 0) cmd.dataoff += self.page_size;
                             },
-                            else => {
-                                if (lc.* == LoadCommand.Unknown) return error.UnknownLoadCommand;
-                            },
+                            else => {}, // No need to check for unknown commands here as we already did when parsing.
                         }
                     }
                     {
@@ -2028,7 +2026,9 @@ fn parseFromFile(self: *MachO, file: fs.File) !void {
         switch (cmd.cmd()) {
             macho.LC_SEGMENT_64 => {
                 const x = cmd.Segment;
-                if (isSegmentOrSection(&x.inner.segname, "__LINKEDIT")) {
+                if (isSegmentOrSection(&x.inner.segname, "__PAGEZERO")) {
+                    self.pagezero_segment_cmd_index = i;
+                } else if (isSegmentOrSection(&x.inner.segname, "__LINKEDIT")) {
                     self.linkedit_segment_cmd_index = i;
                 } else if (isSegmentOrSection(&x.inner.segname, "__TEXT")) {
                     self.text_segment_cmd_index = i;
@@ -2047,11 +2047,37 @@ fn parseFromFile(self: *MachO, file: fs.File) !void {
             macho.LC_SYMTAB => {
                 self.symtab_cmd_index = i;
             },
+            macho.LC_DYSYMTAB => {
+                self.dysymtab_cmd_index = i;
+            },
+            macho.LC_LOAD_DYLINKER => {
+                self.dylinker_cmd_index = i;
+            },
+            macho.LC_VERSION_MIN_MACOSX, macho.LC_VERSION_MIN_IPHONEOS, macho.LC_VERSION_MIN_WATCHOS, macho.LC_VERSION_MIN_TVOS => {
+                self.version_min_cmd_index = i;
+            },
+            macho.LC_SOURCE_VERSION => {
+                self.source_version_cmd_index = i;
+            },
+            macho.LC_MAIN => {
+                self.main_cmd_index = i;
+            },
+            macho.LC_LOAD_DYLIB => {
+                self.libsystem_cmd_index = i; // TODO This is incorrect, but we'll fixup later.
+            },
+            macho.LC_FUNCTION_STARTS => {
+                self.function_starts_cmd_index = i;
+            },
+            macho.LC_DATA_IN_CODE => {
+                self.data_in_code_cmd_index = i;
+            },
             macho.LC_CODE_SIGNATURE => {
                 self.code_signature_cmd_index = i;
             },
-            // TODO populate more MachO fields
-            else => {},
+            else => {
+                std.log.err("Unknown load command detected: 0x{x}.", .{cmd.cmd()});
+                return error.UnknownLoadCommand;
+            },
         }
         self.load_commands.appendAssumeCapacity(cmd);
     }
