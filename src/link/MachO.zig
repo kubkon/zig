@@ -748,7 +748,7 @@ fn linkWithLLD(self: *MachO, comp: *Compilation) !void {
                     // 3. Then, we need to update offsets in export trie.
                     // 4. Finally, we need to update offsets in the symbol table.
                     const linkedit_segment = self.load_commands.items[self.linkedit_segment_cmd_index.?].Segment;
-                    const file_size = linkedit_segment.inner.fileoff + linkedit_segment.inner.filesize;
+                    var file_size = linkedit_segment.inner.fileoff + linkedit_segment.inner.filesize;
                     {
                         // Shift everything from __text section by exactly one page size.
                         const old_offset = text_section.offset;
@@ -768,6 +768,7 @@ fn linkWithLLD(self: *MachO, comp: *Compilation) !void {
                         defer self.base.allocator.free(buffer);
                         mem.set(u8, buffer, 0);
                         try self.base.file.?.pwriteAll(buffer, old_offset);
+                        file_size += self.page_size;
                     }
                     // Update all offsets in the load commands.
                     for (self.load_commands.items) |*lc| {
@@ -824,7 +825,7 @@ fn linkWithLLD(self: *MachO, comp: *Compilation) !void {
                     }
                     {
                         // Update address offsets in the export trie.
-                        const dyld_info = self.load_commands.items[self.dyld_info_cmd_index.?].DyldInfoOnly;
+                        const dyld_info = &self.load_commands.items[self.dyld_info_cmd_index.?].DyldInfoOnly;
                         var buffer = try self.base.allocator.alloc(u8, dyld_info.export_size);
                         defer self.base.allocator.free(buffer);
                         const nread = try self.base.file.?.preadAll(buffer, dyld_info.export_off);
@@ -845,6 +846,63 @@ fn linkWithLLD(self: *MachO, comp: *Compilation) !void {
                         var out_buffer = try trie.writeULEB128Mem();
                         defer self.base.allocator.free(out_buffer);
                         std.debug.print("buffer.len={},out_buffer.len={}\n", .{ buffer.len, out_buffer.len });
+                        if (dyld_info.export_size < out_buffer.len) {
+                            // We need to move all hidden sections by some amount.
+                            const new_export_size = @intCast(u32, mem.alignForwardGeneric(u64, out_buffer.len, @sizeOf(u64)));
+                            const shift = new_export_size - dyld_info.export_size;
+                            const old_offset = dyld_info.export_off + dyld_info.export_size;
+                            const new_offset = old_offset + shift;
+                            const existing_size = file_size - old_offset;
+                            // TODO I think I just discovered a bug with copyRangeAll on macOS.
+                            // Investigate further!
+                            // const amt = try self.base.file.?.copyRangeAll(old_offset, self.base.file.?, new_offset, existing_size);
+                            // if (amt < existing_size) return error.InputOutput;
+                            var in_buffer = try self.base.allocator.alloc(u8, existing_size);
+                            defer self.base.allocator.free(in_buffer);
+                            const nnread = try self.base.file.?.preadAll(in_buffer, old_offset);
+                            if (nnread < in_buffer.len) return error.InputOutput;
+                            try self.base.file.?.pwriteAll(in_buffer, new_offset);
+                            // Zero out everything in between.
+                            var tmp = try self.base.allocator.alloc(u8, new_offset - old_offset);
+                            defer self.base.allocator.free(tmp);
+                            mem.set(u8, tmp, 0);
+                            try self.base.file.?.pwriteAll(tmp, old_offset);
+
+                            var start_i: usize = self.dyld_info_cmd_index.? + 1;
+                            const end_i = self.load_commands.items.len;
+                            while (start_i < end_i) : (start_i += 1) {
+                                const lc = &self.load_commands.items[start_i];
+                                switch (lc.cmd()) {
+                                    macho.LC_SYMTAB => {
+                                        const cmd = &lc.Symtab;
+                                        if (cmd.symoff > 0) cmd.symoff += shift;
+                                        if (cmd.stroff > 0) cmd.stroff += shift;
+                                    },
+                                    macho.LC_DYSYMTAB => {
+                                        const cmd = &lc.Dysymtab;
+                                        if (cmd.tocoff > 0) cmd.tocoff += shift;
+                                        if (cmd.modtaboff > 0) cmd.modtaboff += shift;
+                                        if (cmd.extrefsymoff > 0) cmd.extrefsymoff += shift;
+                                        if (cmd.indirectsymoff > 0) cmd.indirectsymoff += shift;
+                                        if (cmd.extreloff > 0) cmd.extreloff += shift;
+                                        if (cmd.locreloff > 0) cmd.locreloff += shift;
+                                    },
+                                    macho.LC_FUNCTION_STARTS, macho.LC_DATA_IN_CODE, macho.LC_CODE_SIGNATURE => {
+                                        const cmd = &lc.LinkeditData;
+                                        if (cmd.dataoff > 0) cmd.dataoff += shift;
+                                    },
+                                    else => {},
+                                }
+                            }
+                            dyld_info.export_size = new_export_size;
+                            const linkedit = &self.load_commands.items[self.linkedit_segment_cmd_index.?].Segment;
+                            linkedit.inner.filesize += shift;
+                            if (linkedit.inner.vmsize < linkedit.inner.filesize) {
+                                linkedit.inner.vmsize = mem.alignForwardGeneric(u64, linkedit.inner.filesize, self.page_size);
+                            }
+                        }
+                        // Save update export trie.
+                        try self.base.file.?.pwriteAll(out_buffer, dyld_info.export_off);
                     }
                     {
                         // Update address offsets in the symbol table.
