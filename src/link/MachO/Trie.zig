@@ -123,9 +123,10 @@ pub const Node = struct {
     fn fromByteStream(self: *Node, stream: anytype) Trie.FromByteStreamError!void {
         self.trie_offset = try stream.getPos();
         var reader = stream.reader();
-        const node_size = try reader.readByte();
+        const node_size = try leb.readULEB128(u64, reader);
         if (node_size > 0) {
-            self.export_flags = try reader.readByte();
+            self.export_flags = try leb.readULEB128(u64, reader);
+            // TODO Parse flags.
             self.vmaddr_offset = try leb.readULEB128(u64, reader);
         }
         const nedges = try reader.readByte();
@@ -309,16 +310,20 @@ pub fn writeULEB128Mem(self: *Trie) ![]u8 {
 pub fn nodes(self: *Trie) ![]*Node {
     var ordered_nodes = std.ArrayList(*Node).init(self.allocator);
     try ordered_nodes.ensureCapacity(self.node_count);
-    walkInOrder(&self.root.?, &ordered_nodes);
-    return ordered_nodes.toOwnedSlice();
-}
 
-/// Walks the trie in DFS order gathering all nodes into a linear stream of nodes.
-fn walkInOrder(node: *Node, list: *std.ArrayList(*Node)) void {
-    list.appendAssumeCapacity(node);
-    for (node.edges.items) |*edge| {
-        walkInOrder(edge.to, list);
+    comptime const Fifo = std.fifo.LinearFifo(*Node, .{ .Static = std.math.maxInt(u8) });
+    var fifo = Fifo.init();
+    try fifo.writeItem(&self.root.?);
+
+    while (fifo.readItem()) |next| {
+        for (next.edges.items) |*edge| {
+            try fifo.writeItem(edge.to);
+        }
+        std.debug.print("off={}\n", .{next.vmaddr_offset});
+        ordered_nodes.appendAssumeCapacity(next);
     }
+
+    return ordered_nodes.toOwnedSlice();
 }
 
 pub fn deinit(self: *Trie) void {

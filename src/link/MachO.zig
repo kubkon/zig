@@ -836,13 +836,16 @@ fn linkWithLLD(self: *MachO, comp: *Compilation) !void {
                         try trie.fromByteStream(&stream);
                         var nodes = try trie.nodes();
                         defer self.base.allocator.free(nodes);
-                        for (nodes) |node| {
-                            if (node.vmaddr_offset) |*off| {
-                                off.* += self.page_size;
-                            }
-                        }
+                        // for (nodes) |node| {
+                        //     if (node.vmaddr_offset) |*off| {
+                        //         if (off.* > 0)
+                        //             off.* += self.page_size;
+                        //     }
+                        // }
                         var out_buffer = try trie.writeULEB128Mem();
                         defer self.base.allocator.free(out_buffer);
+
+                        std.debug.print("in={}\nout={}\n", .{ buffer.len, out_buffer.len });
                         if (dyld_info.export_size < out_buffer.len) {
                             // We need to move all hidden sections by some amount.
                             const new_export_size = @intCast(u32, mem.alignForwardGeneric(u64, out_buffer.len, @sizeOf(u64)));
@@ -914,17 +917,16 @@ fn linkWithLLD(self: *MachO, comp: *Compilation) !void {
                         var reader = stream.reader();
                         var out_buffer = std.ArrayList(u8).init(self.base.allocator);
                         defer out_buffer.deinit();
-                        var tmp_buffer: [@sizeOf(u64)]u8 = undefined;
 
-                        while (true) {
-                            const off = std.leb.readULEB128(u64, reader) catch |err| switch (err) {
-                                error.EndOfStream => break,
-                                else => |e| return e,
-                            };
-                            var out_stream = std.io.fixedBufferStream(tmp_buffer[0..]);
-                            try std.leb.writeULEB128(out_stream.writer(), off + self.page_size);
-                            try out_buffer.appendSlice(tmp_buffer[0..out_stream.pos]);
-                        }
+                        // Decode the first instance of LEB128 which serves as the starting point for
+                        // the rest of the function starts stream which is effectively a LEB128 encoded
+                        // stream of address offsets in piecewise fashion.
+                        const first_off = try std.leb.readULEB128(u64, reader);
+                        var tmp_buffer: [@sizeOf(u64)]u8 = undefined;
+                        var out_stream = std.io.fixedBufferStream(tmp_buffer[0..]);
+                        try std.leb.writeULEB128(out_stream.writer(), first_off + self.page_size);
+                        try out_buffer.appendSlice(tmp_buffer[0..out_stream.pos]);
+                        try out_buffer.appendSlice(buffer[stream.pos..]);
 
                         if (fstarts.datasize < out_buffer.items.len) {
                             // We need to move all hidden sections by some amount.
