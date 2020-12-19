@@ -1273,6 +1273,7 @@ pub fn populateMissingMetadata(self: *MachO) !void {
         }
         header.reserved = 0;
         self.header = header;
+        self.cmd_table_dirty = true;
     }
     if (self.pagezero_segment_cmd_index == null) {
         self.pagezero_segment_cmd_index = @intCast(u16, self.load_commands.items.len);
@@ -1726,20 +1727,103 @@ fn nextSegmentAddressAndOffset(self: *MachO) NextSegmentAddressAndOffset {
     };
 }
 
-fn detectAllocCollision(self: *MachO, segment: *const SegmentCommand, start: u64, size: u64) ?u64 {
-    const end = start + satMul(size, alloc_num) / alloc_den;
-    for (segment.sections.items) |section| {
-        const increased_size = satMul(section.size, alloc_num) / alloc_den;
-        const test_end = section.offset + increased_size;
-        if (end > section.offset and start < test_end) {
-            return test_end;
-        }
+inline fn checkForCollision(start: u64, end: u64, off: u64, size: u64) ?u64 {
+    const increased_size = satMul(size, alloc_num) / alloc_den;
+    const test_end = off + increased_size;
+    if (end > off and start < test_end) {
+        return test_end;
     }
     return null;
 }
 
+fn detectAllocCollision(self: *MachO, segment: *const SegmentCommand, start: u64, size: u64) ?u64 {
+    const end = start + satMul(size, alloc_num) / alloc_den;
+
+    if (parseAndCmpName(&segment.inner.segname, "__LINKEDIT")) {
+        // __LINKEDIT is a weird segment where sections get their own load commands so we
+        // special-case it.
+        if (self.dyld_info_cmd_index) |idx| {
+            const dyld_info = self.load_commands.items[idx].DyldInfoOnly;
+            if (checkForCollision(start, end, dyld_info.rebase_off, dyld_info.rebase_size)) |pos| {
+                return pos;
+            }
+            // Binding info
+            if (checkForCollision(start, end, dyld_info.bind_off, dyld_info.bind_size)) |pos| {
+                return pos;
+            }
+            // Weak binding info
+            if (checkForCollision(start, end, dyld_info.weak_bind_off, dyld_info.weak_bind_size)) |pos| {
+                return pos;
+            }
+            // Lazy binding info
+            if (checkForCollision(start, end, dyld_info.lazy_bind_off, dyld_info.lazy_bind_size)) |pos| {
+                return pos;
+            }
+            // Export info
+            if (checkForCollision(start, end, dyld_info.export_off, dyld_info.export_size)) |pos| {
+                return pos;
+            }
+        }
+
+        if (self.function_starts_cmd_index) |idx| {
+            const fstart = self.load_commands.items[idx].LinkeditData;
+            if (checkForCollision(start, end, fstart.dataoff, fstart.datasize)) |pos| {
+                return pos;
+            }
+        }
+
+        if (self.data_in_code_cmd_index) |idx| {
+            const dic = self.load_commands.items[idx].LinkeditData;
+            if (checkForCollision(start, end, dic.dataoff, dic.datasize)) |pos| {
+                return pos;
+            }
+        }
+
+        if (self.dysymtab_cmd_index) |idx| {
+            const dysymtab = self.load_commands.items[idx].Dysymtab;
+            // Indirect symbol table
+            const nindirectsize = dysymtab.nindirectsyms * @sizeOf(u32);
+            if (checkForCollision(start, end, dysymtab.indirectsymoff, nindirectsize)) |pos| {
+                return pos;
+            }
+            // TODO Handle more dynamic symbol table sections.
+        }
+
+        if (self.symtab_cmd_index) |idx| {
+            const symtab = self.load_commands.items[idx].Symtab;
+            // Symbol table
+            const symsize = symtab.nsyms * @sizeOf(macho.nlist_64);
+            if (checkForCollision(start, end, symtab.symoff, symsize)) |pos| {
+                return pos;
+            }
+            // String table
+            if (checkForCollision(start, end, symtab.stroff, symtab.strsize)) |pos| {
+                return pos;
+            }
+        }
+
+        if (self.code_signature_cmd_index) |idx| {
+            const codesig = self.load_commands.items[idx].LinkeditData;
+            if (checkForCollision(start, end, codesig.dataoff, codesig.datasize)) |pos| {
+                return pos;
+            }
+        }
+    } else {
+        for (segment.sections.items) |section| {
+            if (checkForCollision(start, end, section.offset, section.size)) |pos| {
+                return pos;
+            }
+        }
+    }
+
+    return null;
+}
+
 fn findFreeSpace(self: *MachO, segment: *const SegmentCommand, object_size: u64, min_alignment: u16) u64 {
-    var start: u64 = if (parseAndCmpName(&segment.inner.segname, "__TEXT")) self.header_pad else 0;
+    var start: u64 = if (parseAndCmpName(&segment.inner.segname, "__TEXT"))
+        self.header_pad // For __TEXT, we need to take into account the header and load commands.
+    else
+        segment.inner.fileoff; // Otherwise, we start at the start of the segment.
     while (self.detectAllocCollision(segment, start, object_size)) |item_end| {
         start = mem.alignForwardGeneric(u64, item_end, min_alignment);
     }
