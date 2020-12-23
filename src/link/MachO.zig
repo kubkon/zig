@@ -1597,6 +1597,36 @@ pub fn populateMissingMetadata(self: *MachO) !void {
         self.header_dirty = true;
         self.load_commands_dirty = true;
     }
+    if (self.dwarf_segment_cmd_index == null) {
+        self.dwarf_segment_cmd_index = @intCast(u16, self.load_commands.items.len);
+
+        const maxprot = macho.VM_PROT_READ | macho.VM_PROT_WRITE | macho.VM_PROT_EXECUTE;
+        const initprot = macho.VM_PROT_READ;
+        const ideal_size = @sizeOf(u64) * self.base.options.symbol_count_hint;
+        const needed_size = mem.alignForwardGeneric(u64, satMul(ideal_size, alloc_num) / alloc_den, self.page_size);
+        const address_and_offset = self.nextSegmentAddressAndOffset();
+        const off = address_and_offset.offset;
+
+        log.debug("found __DWARF segment free space 0x{x} to 0x{x}", .{ off, off + needed_size });
+
+        try self.load_commands.append(self.base.allocator, .{
+            .Segment = SegmentCommand.empty(.{
+                .cmd = macho.LC_SEGMENT_64,
+                .cmdsize = @sizeOf(macho.segment_command_64),
+                .segname = makeStaticString("__DWARF"),
+                .vmaddr = address_and_offset.address,
+                .vmsize = needed_size,
+                .fileoff = off,
+                .filesize = needed_size,
+                .maxprot = maxprot,
+                .initprot = initprot,
+                .nsects = 0,
+                .flags = 0,
+            }),
+        });
+        self.header_dirty = true;
+        self.load_commands_dirty = true;
+    }
     if (self.linkedit_segment_cmd_index == null) {
         self.linkedit_segment_cmd_index = @intCast(u16, self.load_commands.items.len);
 
@@ -1961,16 +1991,14 @@ const NextSegmentAddressAndOffset = struct {
 };
 
 fn nextSegmentAddressAndOffset(self: *MachO) NextSegmentAddressAndOffset {
-    const prev_segment_idx = blk: {
-        if (self.data_segment_cmd_index) |idx| {
-            break :blk idx;
-        } else if (self.text_segment_cmd_index) |idx| {
-            break :blk idx;
-        } else {
-            unreachable; // unhandled LC_SEGMENT_64 load command before __TEXT
+    var prev_segment_idx: ?usize = null; // Optional here to assert there is already at least one load command.
+    for (self.load_commands.items) |lc, i| {
+        switch (lc) {
+            .Segment => prev_segment_idx = i,
+            else => {},
         }
-    };
-    const prev_segment = self.load_commands.items[prev_segment_idx].Segment;
+    }
+    const prev_segment = self.load_commands.items[prev_segment_idx.?].Segment;
     const address = prev_segment.inner.vmaddr + prev_segment.inner.vmsize;
     const offset = prev_segment.inner.fileoff + prev_segment.inner.filesize;
     return .{
