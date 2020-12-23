@@ -10,6 +10,8 @@ const codegen = @import("../codegen.zig");
 const aarch64 = @import("../codegen/aarch64.zig");
 const math = std.math;
 const mem = std.mem;
+const DW = std.dwarf;
+const leb = std.leb;
 
 const trace = @import("../tracy.zig").trace;
 const Type = @import("../type.zig").Type;
@@ -48,6 +50,8 @@ load_commands: std.ArrayListUnmanaged(LoadCommand) = .{},
 pagezero_segment_cmd_index: ?u16 = null,
 /// __TEXT segment
 text_segment_cmd_index: ?u16 = null,
+/// __DWARF segment
+dwarf_segment_cmd_index: ?u16 = null,
 /// __DATA segment
 data_segment_cmd_index: ?u16 = null,
 /// __LINKEDIT segment
@@ -81,6 +85,13 @@ code_signature_cmd_index: ?u16 = null,
 text_section_index: ?u16 = null,
 /// Index into __TEXT,__ziggot section.
 got_section_index: ?u16 = null,
+
+debug_info_section_index: ?u16 = null,
+debug_abbrev_section_index: ?u16 = null,
+debug_str_section_index: ?u16 = null,
+debug_aranges_section_index: ?u16 = null,
+debug_line_section_index: ?u16 = null,
+
 /// The absolute address of the entry point.
 entry_addr: ?u64 = null,
 
@@ -104,6 +115,9 @@ string_table: std.ArrayListUnmanaged(u8) = .{},
 /// Table of trampolines to the actual symbols in __text section.
 offset_table: std.ArrayListUnmanaged(u64) = .{},
 
+/// Table of debug symbol names aka the debug string table.
+debug_string_table: std.ArrayListUnmanaged(u8) = .{},
+
 /// Table of binding info entries.
 binding_info_table: BindingInfoTable = .{},
 /// Table of lazy binding info entries.
@@ -118,6 +132,11 @@ binding_info_dirty: bool = false,
 lazy_binding_info_dirty: bool = false,
 export_info_dirty: bool = false,
 string_table_dirty: bool = false,
+debug_string_table_dirty: bool = false,
+debug_abbrev_section_dirty: bool = false,
+debug_aranges_section_dirty: bool = false,
+debug_info_header_dirty: bool = false,
+debug_line_header_dirty: bool = false,
 
 /// A list of text blocks that have surplus capacity. This list can have false
 /// positives, as functions grow and shrink over time, only sometimes being added
@@ -143,6 +162,18 @@ last_text_block: ?*TextBlock = null,
 /// prior to calling `generateSymbol`, and then immediately deallocated
 /// rather than sitting in the global scope.
 pie_fixups: std.ArrayListUnmanaged(PieFixup) = .{},
+
+/// A list of `SrcFn` whose Line Number Programs have surplus capacity.
+/// This is the same concept as `text_block_free_list`; see those doc comments.
+dbg_line_fn_free_list: std.AutoHashMapUnmanaged(*SrcFn, void) = .{},
+dbg_line_fn_first: ?*SrcFn = null,
+dbg_line_fn_last: ?*SrcFn = null,
+
+/// A list of `TextBlock` whose corresponding .debug_info tags have surplus capacity.
+/// This is the same concept as `text_block_free_list`; see those doc comments.
+dbg_info_decl_free_list: std.AutoHashMapUnmanaged(*TextBlock, void) = .{},
+dbg_info_decl_first: ?*TextBlock = null,
+dbg_info_decl_last: ?*TextBlock = null,
 
 pub const PieFixup = struct {
     /// Target address we wanted to address in absolute terms.
@@ -197,12 +228,25 @@ pub const TextBlock = struct {
     prev: ?*TextBlock,
     next: ?*TextBlock,
 
+    /// Previous/next linked list pointers. This value is `next ^ prev`.
+    /// This is the linked list node for this Decl's corresponding .debug_info tag.
+    dbg_info_prev: ?*TextBlock,
+    dbg_info_next: ?*TextBlock,
+    /// Offset into .debug_info pointing to the tag for this Decl.
+    dbg_info_off: u32,
+    /// Size of the .debug_info tag for this Decl, not including padding.
+    dbg_info_len: u32,
+
     pub const empty = TextBlock{
         .local_sym_index = 0,
         .offset_table_index = undefined,
         .size = 0,
         .prev = null,
         .next = null,
+        .dbg_info_prev = null,
+        .dbg_info_next = null,
+        .dbg_info_off = undefined,
+        .dbg_info_len = undefined,
     };
 
     /// Returns how much room there is to grow in virtual address space.
@@ -238,7 +282,23 @@ pub const Export = struct {
 };
 
 pub const SrcFn = struct {
-    pub const empty = SrcFn{};
+    /// Offset from the beginning of the Debug Line Program header that contains this function.
+    off: u32,
+    /// Size of the line number program component belonging to this function, not
+    /// including padding.
+    len: u32,
+
+    /// Points to the previous and next neighbors, based on the offset from .debug_line.
+    /// This can be used to find, for example, the capacity of this `SrcFn`.
+    prev: ?*SrcFn,
+    next: ?*SrcFn,
+
+    pub const empty: SrcFn = .{
+        .off = 0,
+        .len = 0,
+        .prev = null,
+        .next = null,
+    };
 };
 
 pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Options) !*MachO {
@@ -295,6 +355,13 @@ pub fn createEmpty(gpa: *Allocator, options: link.Options) !*MachO {
     };
     return self;
 }
+
+pub const abbrev_compile_unit = 1;
+pub const abbrev_subprogram = 2;
+pub const abbrev_subprogram_retvoid = 3;
+pub const abbrev_base_type = 4;
+pub const abbrev_pad1 = 5;
+pub const abbrev_parameter = 6;
 
 pub fn flush(self: *MachO, comp: *Compilation) !void {
     if (build_options.have_llvm and self.base.options.use_lld) {
@@ -947,6 +1014,9 @@ pub fn deinit(self: *MachO) void {
     self.text_block_free_list.deinit(self.base.allocator);
     self.offset_table.deinit(self.base.allocator);
     self.offset_table_free_list.deinit(self.base.allocator);
+    self.dbg_info_decl_free_list.deinit(self.base.allocator);
+    self.dbg_line_fn_free_list.deinit(self.base.allocator);
+    self.debug_string_table.deinit(self.base.allocator);
     self.string_table.deinit(self.base.allocator);
     self.undef_symbols.deinit(self.base.allocator);
     self.global_symbols.deinit(self.base.allocator);
@@ -1054,8 +1124,127 @@ pub fn updateDecl(self: *MachO, module: *Module, decl: *Module.Decl) !void {
     var code_buffer = std.ArrayList(u8).init(self.base.allocator);
     defer code_buffer.deinit();
 
+    var dbg_line_buffer = std.ArrayList(u8).init(self.base.allocator);
+    defer dbg_line_buffer.deinit();
+
+    var dbg_info_buffer = std.ArrayList(u8).init(self.base.allocator);
+    defer dbg_info_buffer.deinit();
+
+    var dbg_info_type_relocs: File.DbgInfoTypeRelocsTable = .{};
+    defer {
+        var it = dbg_info_type_relocs.iterator();
+        while (it.next()) |entry| {
+            entry.value.relocs.deinit(self.base.allocator);
+        }
+        dbg_info_type_relocs.deinit(self.base.allocator);
+    }
+
     const typed_value = decl.typed_value.most_recent.typed_value;
-    const res = try codegen.generateSymbol(&self.base, decl.src(), typed_value, &code_buffer, .none);
+    const is_fn: bool = switch (typed_value.ty.zigTypeTag()) {
+        .Fn => true,
+        else => false,
+    };
+    if (is_fn) {
+        const zir_dumps = if (std.builtin.is_test) &[0][]const u8{} else build_options.zir_dumps;
+        if (zir_dumps.len != 0) {
+            for (zir_dumps) |fn_name| {
+                if (mem.eql(u8, mem.spanZ(decl.name), fn_name)) {
+                    std.debug.print("\n{}\n", .{decl.name});
+                    typed_value.val.cast(Value.Payload.Function).?.func.dump(module.*);
+                }
+            }
+        }
+
+        // For functions we need to add a prologue to the debug line program.
+        try dbg_line_buffer.ensureCapacity(26);
+
+        const line_off: u28 = blk: {
+            if (decl.scope.cast(Module.Scope.Container)) |container_scope| {
+                const tree = container_scope.file_scope.contents.tree;
+                const file_ast_decls = tree.root_node.decls();
+                // TODO Look into improving the performance here by adding a token-index-to-line
+                // lookup table. Currently this involves scanning over the source code for newlines.
+                const fn_proto = file_ast_decls[decl.src_index].castTag(.FnProto).?;
+                const block = fn_proto.getBodyNode().?.castTag(.Block).?;
+                const line_delta = std.zig.lineDelta(tree.source, 0, tree.token_locs[block.lbrace].start);
+                break :blk @intCast(u28, line_delta);
+            } else if (decl.scope.cast(Module.Scope.ZIRModule)) |zir_module| {
+                const byte_off = zir_module.contents.module.decls[decl.src_index].inst.src;
+                const line_delta = std.zig.lineDelta(zir_module.source.bytes, 0, byte_off);
+                break :blk @intCast(u28, line_delta);
+            } else {
+                unreachable;
+            }
+        };
+
+        const ptr_width_bytes = @sizeOf(u64);
+        dbg_line_buffer.appendSliceAssumeCapacity(&[_]u8{
+            DW.LNS_extended_op,
+            ptr_width_bytes + 1,
+            DW.LNE_set_address,
+        });
+        // This is the "relocatable" vaddr, corresponding to `code_buffer` index `0`.
+        assert(dbg_line_vaddr_reloc_index == dbg_line_buffer.items.len);
+        dbg_line_buffer.items.len += ptr_width_bytes;
+
+        dbg_line_buffer.appendAssumeCapacity(DW.LNS_advance_line);
+        // This is the "relocatable" relative line offset from the previous function's end curly
+        // to this function's begin curly.
+        assert(self.getRelocDbgLineOff() == dbg_line_buffer.items.len);
+        // Here we use a ULEB128-fixed-4 to make sure this field can be overwritten later.
+        leb.writeUnsignedFixed(4, dbg_line_buffer.addManyAsArrayAssumeCapacity(4), line_off);
+
+        dbg_line_buffer.appendAssumeCapacity(DW.LNS_set_file);
+        assert(self.getRelocDbgFileIndex() == dbg_line_buffer.items.len);
+        // Once we support more than one source file, this will have the ability to be more
+        // than one possible value.
+        const file_index = 1;
+        leb.writeUnsignedFixed(4, dbg_line_buffer.addManyAsArrayAssumeCapacity(4), file_index);
+
+        // Emit a line for the begin curly with prologue_end=false. The codegen will
+        // do the work of setting prologue_end=true and epilogue_begin=true.
+        dbg_line_buffer.appendAssumeCapacity(DW.LNS_copy);
+
+        // .debug_info subprogram
+        const decl_name_with_null = decl.name[0 .. mem.lenZ(decl.name) + 1];
+        try dbg_info_buffer.ensureCapacity(dbg_info_buffer.items.len + 25 + decl_name_with_null.len);
+
+        const fn_ret_type = typed_value.ty.fnReturnType();
+        const fn_ret_has_bits = fn_ret_type.hasCodeGenBits();
+        if (fn_ret_has_bits) {
+            dbg_info_buffer.appendAssumeCapacity(abbrev_subprogram);
+        } else {
+            dbg_info_buffer.appendAssumeCapacity(abbrev_subprogram_retvoid);
+        }
+        // These get overwritten after generating the machine code. These values are
+        // "relocations" and have to be in this fixed place so that functions can be
+        // moved in virtual address space.
+        assert(dbg_info_low_pc_reloc_index == dbg_info_buffer.items.len);
+        dbg_info_buffer.items.len += ptr_width_bytes; // DW.AT_low_pc,  DW.FORM_addr
+        assert(self.getRelocDbgInfoSubprogramHighPC() == dbg_info_buffer.items.len);
+        dbg_info_buffer.items.len += 4; // DW.AT_high_pc,  DW.FORM_data4
+        if (fn_ret_has_bits) {
+            const gop = try dbg_info_type_relocs.getOrPut(self.base.allocator, fn_ret_type);
+            if (!gop.found_existing) {
+                gop.entry.value = .{
+                    .off = undefined,
+                    .relocs = .{},
+                };
+            }
+            try gop.entry.value.relocs.append(self.base.allocator, @intCast(u32, dbg_info_buffer.items.len));
+            dbg_info_buffer.items.len += 4; // DW.AT_type,  DW.FORM_ref4
+        }
+        dbg_info_buffer.appendSliceAssumeCapacity(decl_name_with_null); // DW.AT_name, DW.FORM_string
+    } else {
+        // TODO implement .debug_info for global variables
+    }
+    const res = try codegen.generateSymbol(&self.base, decl.src(), typed_value, &code_buffer, .{
+        .dwarf = .{
+            .dbg_line = &dbg_line_buffer,
+            .dbg_info = &dbg_info_buffer,
+            .dbg_info_type_relocs = &dbg_info_type_relocs,
+        },
+    });
 
     const code = switch (res) {
         .externally_managed => |x| x,
@@ -2280,7 +2469,7 @@ fn updateLinkeditSegmentSizes(self: *MachO) !void {
     const filesize = final_offset - linkedit_segment.inner.fileoff;
     linkedit_segment.inner.filesize = filesize;
     linkedit_segment.inner.vmsize = mem.alignForwardGeneric(u64, filesize, self.page_size);
-    try self.base.file.?.pwriteAll(&[_]u8{ 0 }, final_offset);
+    try self.base.file.?.pwriteAll(&[_]u8{0}, final_offset);
     self.load_commands_dirty = true;
 }
 
@@ -2301,7 +2490,7 @@ fn writeLoadCommands(self: *MachO) !void {
     }
 
     const off = @sizeOf(macho.mach_header_64);
-    log.debug("writing {} load commands from 0x{x} to 0x{x}", .{self.load_commands.items.len, off, off + sizeofcmds});
+    log.debug("writing {} load commands from 0x{x} to 0x{x}", .{ self.load_commands.items.len, off, off + sizeofcmds });
     try self.base.file.?.pwriteAll(buffer, off);
     self.load_commands_dirty = false;
 }
@@ -2319,6 +2508,45 @@ fn writeHeader(self: *MachO) !void {
     log.debug("writing Mach-O header {}", .{self.header.?});
     try self.base.file.?.pwriteAll(mem.asBytes(&self.header.?), 0);
     self.header_dirty = false;
+}
+
+/// The reloc offset for the virtual address of a function in its Line Number Program.
+/// Size is a virtual address integer.
+const dbg_line_vaddr_reloc_index = 3;
+/// The reloc offset for the virtual address of a function in its .debug_info TAG_subprogram.
+/// Size is a virtual address integer.
+const dbg_info_low_pc_reloc_index = 1;
+
+/// The reloc offset for the line offset of a function from the previous function's line.
+/// It's a fixed-size 4-byte ULEB128.
+fn getRelocDbgLineOff(self: MachO) usize {
+    return dbg_line_vaddr_reloc_index + @sizeOf(u64) + 1;
+}
+
+fn getRelocDbgFileIndex(self: MachO) usize {
+    return self.getRelocDbgLineOff() + 5;
+}
+
+fn getRelocDbgInfoSubprogramHighPC(self: MachO) u32 {
+    return dbg_info_low_pc_reloc_index + @sizeOf(u64);
+}
+
+fn dbgLineNeededHeaderBytes(self: MachO) u32 {
+    const directory_entry_format_count = 1;
+    const file_name_entry_format_count = 1;
+    const directory_count = 1;
+    const file_name_count = 1;
+    const root_src_dir_path_len = if (self.base.options.module.?.root_pkg.root_src_directory.path) |p| p.len else 1; // "."
+    return @intCast(u32, 53 + directory_entry_format_count * 2 + file_name_entry_format_count * 2 +
+        directory_count * 8 + file_name_count * 8 +
+        // These are encoded as DW.FORM_string rather than DW.FORM_strp as we would like
+        // because of a workaround for readelf and gdb failing to understand DWARFv5 correctly.
+        root_src_dir_path_len +
+        self.base.options.module.?.root_pkg.root_src_path.len);
+}
+
+fn dbgInfoNeededHeaderBytes(self: MachO) u32 {
+    return 120;
 }
 
 /// Parse MachO contents from existing binary file.
