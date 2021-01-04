@@ -1849,6 +1849,8 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                             },
                             else => unreachable, // unsupported architecture on MachO
                         }
+                    } else if (func_value.castTag(.extern_fn)) |func_payload| {
+                        return self.fail(inst.base.src, "TODO implement calling extern functions", .{});
                     } else {
                         return self.fail(inst.base.src, "TODO implement calling bitcasted functions", .{});
                     }
@@ -3340,8 +3342,11 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                 },
                 .Int => {
                     const info = typed_value.ty.intInfo(self.target.*);
-                    if (info.bits > ptr_bits or info.signedness == .signed) {
-                        return self.fail(src, "TODO const int bigger than ptr and signed int", .{});
+                    if (info.bits > ptr_bits) {
+                        return self.fail(src, "TODO const int bigger than ptr", .{});
+                    }
+                    if (info.signedness == .signed) {
+                        return MCValue{ .immediate = @bitCast(u64, typed_value.val.toSignedInt()) };
                     }
                     return MCValue{ .immediate = typed_value.val.toUnsignedInt() };
                 },

@@ -1112,7 +1112,7 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
             }
             if (fn_proto.getLibName()) |lib_name| blk: {
                 const lib_name_str = mem.trim(u8, tree.tokenSlice(lib_name.firstToken()), "\""); // TODO: call identifierTokenString
-                log.debug("extern fn symbol expected in lib '{}'", .{lib_name_str});
+                log.debug("extern fn symbol expected in lib '{s}'", .{lib_name_str});
                 const target = self.comp.getTarget();
                 if (target_util.is_libc_lib_name(target, lib_name_str)) {
                     if (!self.comp.bin_file.options.link_libc) {

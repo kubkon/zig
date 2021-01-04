@@ -1120,7 +1120,7 @@ pub fn updateDecl(self: *MachO, module: *Module, decl: *Module.Decl) !void {
 
     const typed_value = decl.typed_value.most_recent.typed_value;
     switch (typed_value.val.tag()) {
-        .extern_fn => return error.TODOExternFn,
+        .extern_fn => return, // Nothing to do.
         else => {},
     }
 
