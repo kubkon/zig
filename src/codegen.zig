@@ -3370,11 +3370,8 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                 },
                 .Int => {
                     const info = typed_value.ty.intInfo(self.target.*);
-                    if (info.bits > ptr_bits) {
-                        return self.fail(src, "TODO const int bigger than ptr", .{});
-                    }
-                    if (info.signedness == .signed) {
-                        return MCValue{ .immediate = @bitCast(u64, typed_value.val.toSignedInt()) };
+                    if (info.bits > ptr_bits or info.signedness == .signed) {
+                        return self.fail(src, "TODO const int bigger than ptr and signed int", .{});
                     }
                     return MCValue{ .immediate = typed_value.val.toUnsignedInt() };
                 },
