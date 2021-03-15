@@ -43,6 +43,7 @@ const usage =
     \\  build-exe        Create executable from source or object files
     \\  build-lib        Create library from source or object files
     \\  build-obj        Create object from source or object files
+    \\  ar               Use Zig as a drop-in ar archiver
     \\  cc               Use Zig as a drop-in C compiler
     \\  c++              Use Zig as a drop-in C++ compiler
     \\  env              Print lib path, std path, cache directory, and version
@@ -180,6 +181,8 @@ pub fn mainArgs(gpa: *Allocator, arena: *Allocator, args: []const []const u8) !v
         return buildOutputType(gpa, arena, args, .cc);
     } else if (mem.eql(u8, cmd, "c++")) {
         return buildOutputType(gpa, arena, args, .cpp);
+    } else if (mem.eql(u8, cmd, "ar")) {
+        return buildOutputType(gpa, arena, args, .ar);
     } else if (mem.eql(u8, cmd, "translate-c")) {
         return buildOutputType(gpa, arena, args, .translate_c);
     } else if (mem.eql(u8, cmd, "clang") or
@@ -472,6 +475,7 @@ fn buildOutputType(
     all_args: []const []const u8,
     arg_mode: union(enum) {
         build: std.builtin.OutputMode,
+        ar,
         cc,
         cpp,
         translate_c,
@@ -547,7 +551,6 @@ fn buildOutputType(
     var image_base_override: ?u64 = null;
     var use_llvm: ?bool = null;
     var use_lld: ?bool = null;
-    var use_zld: ?bool = null;
     var use_clang: ?bool = null;
     var link_eh_frame_hdr = false;
     var link_emit_relocs = false;
@@ -907,8 +910,6 @@ fn buildOutputType(
                         use_lld = true;
                     } else if (mem.eql(u8, arg, "-fno-LLD")) {
                         use_lld = false;
-                    } else if (mem.eql(u8, arg, "-fZLD")) {
-                        use_zld = true;
                     } else if (mem.eql(u8, arg, "-fClang")) {
                         use_clang = true;
                     } else if (mem.eql(u8, arg, "-fno-Clang")) {
@@ -1044,6 +1045,26 @@ fn buildOutputType(
             if (optimize_mode_string) |s| {
                 optimize_mode = std.meta.stringToEnum(std.builtin.Mode, s) orelse
                     fatal("unrecognized optimization mode: '{s}'", .{s});
+            }
+        },
+        .ar => {
+            emit_h = .no;
+            soname = .no;
+            output_mode = .Lib;
+            link_mode = .Static;
+
+            // TODO parse actual flags. Skip for now...
+            // Then, first arg is the output name.
+            const name = all_args[3];
+            const name_start = mem.indexOf(u8, name, "lib") orelse unreachable;
+            const name_len = mem.indexOf(u8, name, ".a") orelse unreachable;
+            provided_name = name[name_start + 3 .. name_len];
+
+            // Finally, parse the input .o files.
+            const args = all_args[4..];
+            var i: usize = 0;
+            while (i < args.len) : (i += 1) {
+                try link_objects.append(args[i]);
             }
         },
         .cc, .cpp => {
@@ -1867,7 +1888,6 @@ fn buildOutputType(
         .want_compiler_rt = want_compiler_rt,
         .use_llvm = use_llvm,
         .use_lld = use_lld,
-        .use_zld = use_zld,
         .use_clang = use_clang,
         .rdynamic = rdynamic,
         .linker_script = linker_script,
@@ -3245,7 +3265,8 @@ pub const ClangArgIterator = struct {
                 self.zig_equivalent = clang_arg.zig_equivalent;
                 break :find_clang_arg;
             },
-        } else {
+        }
+        else {
             fatal("Unknown Clang option: '{s}'", .{arg});
         }
     }
