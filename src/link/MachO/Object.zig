@@ -9,6 +9,7 @@ const macho = std.macho;
 const mem = std.mem;
 
 const Allocator = mem.Allocator;
+const Symtab = @import("Symtab.zig");
 const parseName = @import("Zld.zig").parseName;
 
 usingnamespace @import("commands.zig");
@@ -36,6 +37,8 @@ dwarf_debug_str_index: ?u16 = null,
 dwarf_debug_line_index: ?u16 = null,
 dwarf_debug_ranges_index: ?u16 = null,
 
+symtab_temp: Symtab = .{},
+
 symtab: std.ArrayListUnmanaged(macho.nlist_64) = .{},
 strtab: std.ArrayListUnmanaged(u8) = .{},
 
@@ -46,6 +49,7 @@ pub fn deinit(self: *Object) void {
         lc.deinit(self.allocator);
     }
     self.load_commands.deinit(self.allocator);
+    self.symtab_temp.deinit(self.allocator);
     self.symtab.deinit(self.allocator);
     self.strtab.deinit(self.allocator);
     self.data_in_code_entries.deinit(self.allocator);
@@ -91,6 +95,7 @@ pub fn initFromFile(allocator: *Allocator, arch: std.Target.Cpu.Arch, name: []co
     try self.readLoadCommands(reader, .{});
 
     if (self.symtab_cmd_index != null) {
+        try self.parseSymtab();
         try self.readSymtab();
         try self.readStrtab();
     }
@@ -174,6 +179,43 @@ pub fn readLoadCommands(self: *Object, reader: anytype, offset: ReadOffset) !voi
     }
 }
 
+pub fn parseSymtab(self: *Object) !void {
+    const symtab_cmd = self.load_commands.items[self.symtab_cmd_index.?].Symtab;
+
+    var symtab = try self.allocator.alloc(u8, @sizeOf(macho.nlist_64) * symtab_cmd.nsyms);
+    defer self.allocator.free(symtab);
+
+    var strtab = try self.allocator.alloc(u8, symtab_cmd.stroff);
+    defer self.allocator.free(strtab);
+
+    _ = try self.file.preadAll(symtab, symtab_cmd.symoff);
+    _ = try self.file.preadAll(strtab, symtab_cmd.stroff);
+
+    const symbols = @alignCast(@alignOf(macho.nlist_64), mem.bytesAsSlice(macho.nlist_64, symtab));
+
+    for (symbols.items) |symbol| {
+        const sym_name = getString(strtab.items, symbol.n_strx);
+        const n_type = symbol.n_type;
+        const n_desc = symbol.n_desc;
+        const is_stab = isStab(n_type);
+        const is_local = isDef(n_type) and !isExt(n_type);
+        const is_global = isDef(n_type) and isExt(n_type);
+        const is_undef = isUndf(n_type) and isExt(n_type);
+
+        if (isStab(n_type)) {
+            try self.symtab_temp.put(self.allocator, sym_name, .{
+                .tt = .Stab,
+
+            })
+        }
+    }
+
+    try self.symtab.ensureCapacity(self.allocator, symtab_cmd.nsyms);
+    // TODO this align case should not be needed.
+    // Probably a bug in stage1.
+    self.symtab.appendSliceAssumeCapacity(slice);
+}
+
 pub fn readSymtab(self: *Object) !void {
     const symtab_cmd = self.load_commands.items[self.symtab_cmd_index.?].Symtab;
     var buffer = try self.allocator.alloc(u8, @sizeOf(macho.nlist_64) * symtab_cmd.nsyms);
@@ -226,4 +268,35 @@ pub fn readDataInCode(self: *Object) !void {
         };
         try self.data_in_code_entries.append(self.allocator, dice);
     }
+}
+
+fn isStab(n_type: u8) bool {
+    return (macho.N_STAB & n_type) != 0;
+}
+
+fn isPrivExt(n_type: u8) bool {
+    return (macho.N_PEXT & n_type) != 0;
+}
+
+fn isExt(n_type: u8) bool {
+    return (macho.N_EXT & n_type) != 0;
+}
+
+fn isDef(n_type: u8) bool {
+    const type_ = macho.N_TYPE & n_type;
+    return type_ == macho.N_SECT;
+}
+
+fn isUndf(n_type: u8) bool {
+    const type_ = macho.N_TYPE & n_type;
+    return type_ == macho.N_UNDF;
+}
+
+fn isWeakDef(n_desc: u16) bool {
+    return n_desc == macho.N_WEAK_DEF;
+}
+
+fn getStringg(strtab: []const u8, offset: u32) []const u8 {
+    assert(offset < strtab.len);
+    return mem.spanZ(@ptrCast([*:0]const u8, strtab.ptr + offset));
 }

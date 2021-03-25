@@ -16,6 +16,7 @@ const Allocator = mem.Allocator;
 const CodeSignature = @import("CodeSignature.zig");
 const Archive = @import("Archive.zig");
 const Object = @import("Object.zig");
+const Symtab = @import("Symtab.zig");
 const Trie = @import("Trie.zig");
 
 usingnamespace @import("commands.zig");
@@ -73,6 +74,8 @@ tlv_bss_section_index: ?u16 = null,
 la_symbol_ptr_section_index: ?u16 = null,
 data_section_index: ?u16 = null,
 bss_section_index: ?u16 = null,
+
+symtab: Symtab = .{},
 
 locals: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(Symbol)) = .{},
 exports: std.StringArrayHashMapUnmanaged(macho.nlist_64) = .{},
@@ -218,6 +221,11 @@ pub fn init(allocator: *Allocator) Zld {
 }
 
 pub fn deinit(self: *Zld) void {
+    self.symtab.deinit(self.allocator);
+    // for (self.symtab.items()) |*entry| {
+    //     self.allocator.free(entry.key);
+    // }
+    // self.symtab.deinit(self.allocator);
     self.threadlocal_offsets.deinit(self.allocator);
     self.strtab.deinit(self.allocator);
     self.local_rebases.deinit(self.allocator);
@@ -315,6 +323,7 @@ fn parseInputFiles(self: *Zld, files: []const []const u8) !void {
             };
             const index = @intCast(u16, self.objects.items.len);
             try self.objects.append(self.allocator, object);
+            try self.updateSymtab(index);
             try self.updateMetadata(index);
             continue;
         }
@@ -795,6 +804,73 @@ fn sortSections(self: *Zld) !void {
             const new_index = data_index_mapping.get(mapping.target_sect_id) orelse unreachable;
             mapping.target_sect_id = new_index;
         } else unreachable;
+    }
+}
+
+fn isStab(n_type: u8) bool {
+    return (macho.N_STAB & n_type) != 0;
+}
+
+fn isPrivExt(n_type: u8) bool {
+    return (macho.N_PEXT & n_type) != 0;
+}
+
+fn isExt(n_type: u8) bool {
+    return (macho.N_EXT & n_type) != 0;
+}
+
+fn isDef(n_type: u8) bool {
+    const type_ = macho.N_TYPE & n_type;
+    return type_ == macho.N_SECT;
+}
+
+fn isUndf(n_type: u8) bool {
+    const type_ = macho.N_TYPE & n_type;
+    return type_ == macho.N_UNDF;
+}
+
+fn isWeakDeff(n_desc: u16) bool {
+    return n_desc == macho.N_WEAK_DEF;
+}
+
+fn updateSymtab(self: *Zld, index: u16) !void {
+    const object = self.objects.items[index];
+
+    for (object.symtab.items) |sym| {
+        const n_type = sym.n_type;
+        const n_desc = sym.n_desc;
+        const is_local = isStab(n_type) or (isDef(n_type) and !isExt(n_type));
+        const is_global = isDef(n_type) and isExt(n_type);
+        const is_undef = isUndf(n_type) and isExt(n_type);
+
+        if (is_local) continue; // If symbol is local to CU, we don't put it in global symtab.
+
+        const name = object.getString(sym.n_strx);
+        const tt: Symtab.Type = tt: {
+            if (is_global) {
+                if (isWeakDeff(n_desc)) {
+                    break :tt .Weak;
+                } else {
+                    break :tt .Strong;
+                }
+            } else if (is_undef) {
+                break :tt .Undef;
+            } else {
+                // Oh no, unhandled symbol type, report back to the user.
+                log.err("unhandled symbol with n_type=0x{x} and n_desc=0x{x}", .{ n_type, n_desc });
+                return error.UnhandledSymbolType;
+            }
+        };
+
+        try self.symtab.put(self.allocator, name, .{
+            .tt = tt,
+            .index = index,
+        });
+    }
+
+    log.warn("\n\nsymtab after {s}", .{object.name});
+    for (self.symtab.symbols.items()) |entry| {
+        log.warn("    | {s} => {any}", .{ entry.key, entry.value });
     }
 }
 

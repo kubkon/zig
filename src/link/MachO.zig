@@ -3291,3 +3291,7 @@ pub fn padToIdeal(actual_size: anytype) @TypeOf(actual_size) {
     return std.math.add(@TypeOf(actual_size), actual_size, actual_size / ideal_factor) catch
         std.math.maxInt(@TypeOf(actual_size));
 }
+
+test "" {
+    std.testing.refAllDecls(@This());
+}
